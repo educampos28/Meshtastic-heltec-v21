@@ -117,9 +117,9 @@ namespace
 constexpr uint8_t FILES_MANIFEST_LEVELS = 3;
 constexpr size_t FILES_MANIFEST_MAX_COUNT = 64;
 
-void releaseFilesManifest(std::vector<meshtastic_FileInfo> &filesManifest)
+void releaseFilesManifest(FileManifest &filesManifest)
 {
-    std::vector<meshtastic_FileInfo>().swap(filesManifest);
+    filesManifest.clear();
 }
 } // namespace
 
@@ -394,6 +394,7 @@ void PhoneAPI::handleStartConfig()
     // Manifest is never read on the node-info-only path (STATE_SEND_FILEMANIFEST
     // short-circuits to sendConfigComplete), so skip the SPI lock + FS walk.
     if (config_nonce != SPECIAL_NONCE_ONLY_NODES) {
+        releaseFilesManifest(filesManifest);
         bool filesManifestLimited = false;
         {
             concurrency::LockGuard guard(spiLock);
@@ -1095,7 +1096,7 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
             sendConfigComplete();
         } else {
             fromRadioScratch.which_payload_variant = meshtastic_FromRadio_fileInfo_tag;
-            fromRadioScratch.fileInfo = filesManifest.at(config_state);
+            fromRadioScratch.fileInfo = filesManifest[config_state];
             LOG_TRACE("File: %s (%d) bytes", fromRadioScratch.fileInfo.file_name, fromRadioScratch.fileInfo.size_bytes);
             config_state++;
         }

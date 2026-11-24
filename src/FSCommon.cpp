@@ -196,18 +196,36 @@ bool copyFilePath(char *dest, size_t destSize, const char *path, bool *wasLimite
     return true;
 }
 
-void collectFiles(const char *dirname, uint8_t levels, size_t maxCount, std::vector<meshtastic_FileInfo> &filenames,
-                  bool *wasLimited)
+bool hasManifestMemory(size_t allocationBytes = 0)
 {
-    if (!dirname)
-        return;
+#ifdef ARCH_ESP32
+    // Leave internal RAM for LittleFS handles and BLE responses, including a moving realloc().
+    constexpr size_t minFreeHeap = 8192;
+    const size_t freeHeap = ESP.getFreeHeap();
+    return freeHeap >= minFreeHeap && allocationBytes <= freeHeap - minFreeHeap;
+#else
+    (void)allocationBytes;
+    return true;
+#endif
+}
+
+bool collectFiles(const char *dirname, uint8_t levels, size_t maxCount, FileManifest &filenames, bool *wasLimited)
+{
+    if (!dirname || !hasManifestMemory()) {
+        if (wasLimited)
+            *wasLimited = true;
+        return false;
+    }
 
     File root = FSCom.open(dirname, FILE_O_READ);
-    if (!root)
-        return;
+    if (!root) {
+        if (wasLimited)
+            *wasLimited = true;
+        return false;
+    }
     if (!root.isDirectory()) {
         root.close();
-        return;
+        return true;
     }
 
     File file = root.openNextFile();
@@ -231,7 +249,10 @@ void collectFiles(const char *dirname, uint8_t levels, size_t maxCount, std::vec
             file.close();
 
             if (levels && hasSubDirPath) {
-                collectFiles(pathBuffer, levels - 1, maxCount, filenames, wasLimited);
+                if (!collectFiles(pathBuffer, levels - 1, maxCount, filenames, wasLimited)) {
+                    root.close();
+                    return false;
+                }
             } else if (wasLimited) {
                 *wasLimited = true;
             }
@@ -243,13 +264,20 @@ void collectFiles(const char *dirname, uint8_t levels, size_t maxCount, std::vec
             bool hasFilePath = copyFilePath(fileInfo.file_name, sizeof(fileInfo.file_name), file.name(), wasLimited);
 #endif
             if (hasFilePath && !pathEndsWithDot(fileInfo.file_name)) {
-                filenames.push_back(fileInfo);
+                if (!hasManifestMemory((filenames.size() + 1) * sizeof(fileInfo)) || !filenames.append(fileInfo)) {
+                    if (wasLimited)
+                        *wasLimited = true;
+                    file.close();
+                    root.close();
+                    return false;
+                }
             }
             file.close();
         }
         file = root.openNextFile();
     }
     root.close();
+    return true;
 }
 } // namespace
 #endif
@@ -263,53 +291,15 @@ void collectFiles(const char *dirname, uint8_t levels, size_t maxCount, std::vec
  * @param dirname The name of the directory.
  * @param levels The number of levels of subdirectories to list.
  * @param maxCount The maximum number of files to collect before truncating the walk.
- * @param wasLimited Optional out-param, set to true if the listing was truncated (by maxCount or low memory).
- * @return A vector of meshtastic_FileInfo for each file in the directory.
+ * @param wasLimited Optional out-param, set to true if the listing was truncated or a directory could not be opened.
+ * @return A manifest containing the files collected before a limit or failure.
  */
-std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels, size_t maxCount, bool *wasLimited)
+FileManifest getFiles(const char *dirname, uint8_t levels, size_t maxCount, bool *wasLimited, FileManifest::Reallocate reallocate)
 {
-    std::vector<meshtastic_FileInfo> filenames = {};
+    FileManifest filenames(reallocate);
     if (wasLimited)
         *wasLimited = false;
 #ifdef FSCom
-    // Size the vector once, up front, to what the heap can actually hand out, and cap the walk at that
-    // count so push_back() never has to grow it. Any allocation that fails here goes through operator
-    // new and raises std::bad_alloc; the ESP32 framework is built with CONFIG_COMPILER_CXX_EXCEPTIONS=n,
-    // so there is no unwinder and a throw is std::terminate() -> abort() -> reboot. That fires on the
-    // very first client handshake whenever the heap is fragmented (WiFi + TLS up, no PSRAM), which is
-    // exactly when this runs. So: never let reserve() be the thing that discovers there is no room.
-    // Cap at what a vector of FileInfo can hold at all: it keeps the probe's byte count from wrapping
-    // for a huge maxCount, and it is also the bound reserve() would otherwise reject with a throw.
-    size_t reservedCount = std::min(maxCount, filenames.max_size());
-    // Probe with malloc() - the allocation that returns nullptr on failure under every build (new(std::nothrow)
-    // is not that: libstdc++ implements it as a try/catch around the throwing form) - free the probe, and
-    // reserve the size that fit. Not airtight against a concurrent allocator, but the SPI lock the caller holds
-    // serialises the usual competitors and it is strictly better than letting reserve() be the first to find
-    // out. On ESP32 do NOT replace this with heap_caps_get_largest_free_block(): it walks every TLSF block of
-    // every matching heap while holding the allocator lock, and on PSRAM boards that walk blocks wifi_malloc()
-    // on the other core long enough to trip the interrupt watchdog (#11666).
-    while (reservedCount > 0) {
-        void *probe = malloc(reservedCount * sizeof(meshtastic_FileInfo));
-        if (probe) {
-            // Observable access so LTO cannot elide the malloc()/free() pair and turn the probe
-            // into a compile-time yes.
-            *static_cast<volatile char *>(probe) = 0;
-            free(probe);
-            break;
-        }
-        reservedCount /= 2;
-    }
-    if (reservedCount == 0) {
-        if (wasLimited)
-            *wasLimited = true;
-        return filenames;
-    }
-    if (reservedCount < maxCount) {
-        if (wasLimited)
-            *wasLimited = true;
-        maxCount = reservedCount;
-    }
-    filenames.reserve(reservedCount);
     collectFiles(dirname, levels, maxCount, filenames, wasLimited);
 #endif
     return filenames;

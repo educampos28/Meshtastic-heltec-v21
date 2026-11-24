@@ -1,5 +1,6 @@
 #pragma once
 
+#include "FileManifest.h"
 #include "Observer.h"
 #include "concurrency/Lock.h"
 #include "mesh-pb-constants.h"
@@ -144,7 +145,7 @@ class PhoneAPI
     uint32_t config_nonce = 0;
     uint32_t readIndex = 0;
 
-    std::vector<meshtastic_FileInfo> filesManifest = {};
+    FileManifest filesManifest;
 
     void resetReadIndex() { readIndex = 0; }
 

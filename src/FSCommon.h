@@ -1,7 +1,7 @@
 #pragma once
 
+#include "FileManifest.h"
 #include "configuration.h"
-#include <vector>
 
 // Cross platform filesystem API
 
@@ -57,7 +57,8 @@ size_t fsUsedBytes();
 void fsInit();
 bool renameFile(const char *pathFrom, const char *pathTo);
 bool fsFormat();
-std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels, size_t maxCount = 64, bool *wasLimited = nullptr);
+FileManifest getFiles(const char *dirname, uint8_t levels, size_t maxCount = 64, bool *wasLimited = nullptr,
+                      FileManifest::Reallocate reallocate = std::realloc);
 void listDir(const char *dirname, uint8_t levels, bool del = false);
 void rmDir(const char *dirname);
 void setupSDCard();

@@ -1,11 +1,7 @@
-// Tests for getFiles() - the bounded file-manifest walk in src/FSCommon.cpp that PhoneAPI's
-// STATE_SEND_FILEMANIFEST drives on every phone sync. Nothing else asserts its bounding behaviour:
-// the walk does run unasserted from test_stream_api's handshakes, but no test covers the cap, the
-// depth limit, the wasLimited paths, overlong-path rejection, or capacity release.
-//
-// These assert what the code does today. Today's code is already correct here - #10778 landed the
-// by-reference collectFiles(), the 64-entry cap, strlcpy bounds and the swap-idiom release - so all
-// of these describe present behaviour rather than a pending fix.
+// Tests for getFiles() in src/FSCommon.cpp and its FileManifest storage. Phone sync must bound
+// traversal and report incomplete results without a throwing allocation. These guard against
+// reserving 14 KB for an empty manifest, silent directory-open failures, and losing collected
+// entries when an allocation fails or ownership moves between syncs.
 #include "MeshTypes.h"
 #include "TestUtil.h"
 // FSCommon.h is what defines FSCom, so it has to be included before anything tests for it.
@@ -13,7 +9,6 @@
 #include <cstdio>
 #include <cstring>
 #include <unity.h>
-#include <vector>
 
 #ifdef FSCom
 
@@ -21,6 +16,12 @@
 // to its mountpoint, so going through the same API is the only way the test stays agnostic about
 // where that mountpoint is.
 static const char *kRoot = "/test_getfiles";
+static size_t manifestAllocationLimit;
+
+static void *limitedReallocate(void *buffer, size_t bytes)
+{
+    return bytes <= manifestAllocationLimit ? std::realloc(buffer, bytes) : nullptr;
+}
 
 static void makeFile(const char *path, size_t bytes)
 {
@@ -31,7 +32,7 @@ static void makeFile(const char *path, size_t bytes)
     f.close();
 }
 
-static bool manifestContains(const std::vector<meshtastic_FileInfo> &files, const char *suffix)
+static bool manifestContains(const FileManifest &files, const char *suffix)
 {
     for (const auto &f : files) {
         const size_t nameLen = strlen(f.file_name);
@@ -44,6 +45,7 @@ static bool manifestContains(const std::vector<meshtastic_FileInfo> &files, cons
 
 void setUp(void)
 {
+    manifestAllocationLimit = 0;
     rmDir(kRoot);
     FSCom.mkdir(kRoot);
 }
@@ -194,35 +196,110 @@ void test_getfiles_reports_sizes(void)
     TEST_ASSERT_TRUE(found);
 }
 
-// 7. A directory that does not exist is empty and untruncated, not a crash.
+// 7. Failure to enumerate a directory must not be reported as a complete, empty listing.
 void test_getfiles_missing_dir_is_empty(void)
 {
     bool limited = true;
     auto files = getFiles("/test_getfiles_does_not_exist", 3, 64, &limited);
     TEST_ASSERT_EQUAL_size_t(0, files.size());
+    TEST_ASSERT_TRUE(limited);
+    TEST_ASSERT_NULL(files.begin());
+}
+
+void test_getfiles_empty_dir_does_not_allocate_manifest(void)
+{
+    const char *emptyRoot = "/test_getfiles/empty";
+    TEST_ASSERT_TRUE(FSCom.mkdir(emptyRoot));
+    bool limited = true;
+    auto files = getFiles(emptyRoot, 3, 64, &limited);
+    TEST_ASSERT_EQUAL_size_t(0, files.size());
+    TEST_ASSERT_NULL(files.begin());
     TEST_ASSERT_FALSE(limited);
 }
 
-// 8. Capacity release. PhoneAPI's releaseFilesManifest() is file-local, so this pins the idiom it
-//    uses rather than calling it: a manifest reserved for 64 entries holds ~14 KB of file_name
-//    buffers, and clear() returns none of it. A size-only assertion would pass on clear(), which is
-//    exactly the bug #7924 shipped.
+void test_getfiles_allocation_failure_reports_incomplete_listing(void)
+{
+    makeFile("/test_getfiles/first.txt", 17);
+    bool limited = false;
+    auto files = getFiles(kRoot, 3, 64, &limited, limitedReallocate);
+    TEST_ASSERT_TRUE(limited);
+    TEST_ASSERT_EQUAL_size_t(0, files.size());
+    TEST_ASSERT_NULL(files.begin());
+}
+
+void test_getfiles_growth_failure_keeps_partial_listing(void)
+{
+    makeFile("/test_getfiles/first.txt", 17);
+    makeFile("/test_getfiles/second.txt", 17);
+    manifestAllocationLimit = sizeof(meshtastic_FileInfo);
+    bool limited = false;
+    auto files = getFiles(kRoot, 3, 64, &limited, limitedReallocate);
+    TEST_ASSERT_TRUE(limited);
+    TEST_ASSERT_EQUAL_size_t(1, files.size());
+    TEST_ASSERT_EQUAL_UINT32(17, files[0].size_bytes);
+}
+
 void test_release_files_manifest_frees_capacity(void)
 {
-    std::vector<meshtastic_FileInfo> manifest;
-    manifest.reserve(64);
+    FileManifest manifest;
     for (int i = 0; i < 64; i++) {
         meshtastic_FileInfo info = {"", 0};
         snprintf(info.file_name, sizeof(info.file_name), "/f%02d.txt", i);
-        manifest.push_back(info);
+        TEST_ASSERT_TRUE(manifest.append(info));
     }
     TEST_ASSERT_EQUAL_size_t(64, manifest.size());
-    TEST_ASSERT_GREATER_OR_EQUAL_size_t(64, manifest.capacity());
-
-    std::vector<meshtastic_FileInfo>().swap(manifest);
+    manifest.clear();
 
     TEST_ASSERT_EQUAL_size_t(0, manifest.size());
-    TEST_ASSERT_EQUAL_size_t(0, manifest.capacity());
+    TEST_ASSERT_NULL(manifest.begin());
+}
+
+void test_manifest_first_allocation_failure_is_safe(void)
+{
+    FileManifest manifest(limitedReallocate);
+    meshtastic_FileInfo info = {"/first.txt", 1};
+    TEST_ASSERT_FALSE(manifest.append(info));
+    TEST_ASSERT_EQUAL_size_t(0, manifest.size());
+    TEST_ASSERT_NULL(manifest.begin());
+}
+
+void test_manifest_growth_failure_preserves_entries(void)
+{
+    FileManifest manifest(limitedReallocate);
+    manifestAllocationLimit = sizeof(meshtastic_FileInfo);
+    meshtastic_FileInfo first = {"/first.txt", 17};
+    meshtastic_FileInfo second = {"/second.txt", 29};
+    TEST_ASSERT_TRUE(manifest.append(first));
+    TEST_ASSERT_FALSE(manifest.append(second));
+    TEST_ASSERT_EQUAL_size_t(1, manifest.size());
+    TEST_ASSERT_EQUAL_STRING(first.file_name, manifest[0].file_name);
+    TEST_ASSERT_EQUAL_UINT32(first.size_bytes, manifest[0].size_bytes);
+
+    manifestAllocationLimit *= 2;
+    TEST_ASSERT_TRUE(manifest.append(second));
+    TEST_ASSERT_EQUAL_size_t(2, manifest.size());
+    TEST_ASSERT_EQUAL_STRING(second.file_name, manifest[1].file_name);
+}
+
+void test_manifest_move_releases_previous_sync(void)
+{
+    FileManifest previous;
+    FileManifest next;
+    meshtastic_FileInfo first = {"/previous.txt", 17};
+    meshtastic_FileInfo second = {"/next.txt", 29};
+    TEST_ASSERT_TRUE(previous.append(first));
+    TEST_ASSERT_TRUE(next.append(second));
+    previous = std::move(next);
+    TEST_ASSERT_EQUAL_size_t(1, previous.size());
+    TEST_ASSERT_EQUAL_STRING(second.file_name, previous[0].file_name);
+    TEST_ASSERT_EQUAL_size_t(0, next.size());
+    TEST_ASSERT_NULL(next.begin());
+
+    FileManifest moved(std::move(previous));
+    TEST_ASSERT_EQUAL_size_t(1, moved.size());
+    TEST_ASSERT_EQUAL_STRING(second.file_name, moved[0].file_name);
+    TEST_ASSERT_NULL(previous.begin());
+    TEST_ASSERT_EQUAL_size_t(0, previous.size());
 }
 
 #endif // FSCom
@@ -241,7 +318,13 @@ void setup()
     RUN_TEST(test_getfiles_skips_dot_entries);
     RUN_TEST(test_getfiles_reports_sizes);
     RUN_TEST(test_getfiles_missing_dir_is_empty);
+    RUN_TEST(test_getfiles_empty_dir_does_not_allocate_manifest);
+    RUN_TEST(test_getfiles_allocation_failure_reports_incomplete_listing);
+    RUN_TEST(test_getfiles_growth_failure_keeps_partial_listing);
     RUN_TEST(test_release_files_manifest_frees_capacity);
+    RUN_TEST(test_manifest_first_allocation_failure_is_safe);
+    RUN_TEST(test_manifest_growth_failure_preserves_entries);
+    RUN_TEST(test_manifest_move_releases_previous_sync);
 #endif
     exit(UNITY_END());
 }
