@@ -4,6 +4,7 @@
 #include "NimbleBluetooth.h"
 #include "PowerFSM.h"
 #include "StaticPointerQueue.h"
+#include "UptimeClock.h"
 
 #include "concurrency/OSThread.h"
 #include "main.h"
@@ -35,6 +36,40 @@ constexpr uint16_t kPreferredBleMtu = 517;
 constexpr uint16_t kPreferredBleTxOctets = 251;
 constexpr uint16_t kPreferredBleTxTimeUs = (kPreferredBleTxOctets + 14) * 8;
 constexpr int32_t kBleAdvertisingRetryMs = 2000;
+
+void logBleSecuritySettings(const char *phase)
+{
+    LOG_INFO("BLE security %s: io=%u bond=%u mitm=%u sc=%u heap=%u min_heap=%u", phase, ble_hs_cfg.sm_io_cap,
+             ble_hs_cfg.sm_bonding, ble_hs_cfg.sm_mitm, ble_hs_cfg.sm_sc, ESP.getFreeHeap(), ESP.getMinFreeHeap());
+}
+
+int logBleGapEvent(ble_gap_event *event, void *)
+{
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        if (event->connect.status != 0)
+            LOG_WARN("BLE GAP connection failed: status=%d (0x%x)", event->connect.status, event->connect.status);
+        break;
+    case BLE_GAP_EVENT_DISCONNECT:
+        LOG_INFO("BLE GAP disconnect: handle=%u reason=%d (0x%x)", event->disconnect.conn.conn_handle, event->disconnect.reason,
+                 event->disconnect.reason);
+        break;
+    case BLE_GAP_EVENT_ADV_COMPLETE:
+        LOG_INFO("BLE advertising complete: reason=%d (0x%x)", event->adv_complete.reason, event->adv_complete.reason);
+        break;
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        LOG_INFO("BLE GAP connection update: handle=%u status=%d (0x%x)", event->conn_update.conn_handle,
+                 event->conn_update.status, event->conn_update.status);
+        break;
+    case BLE_GAP_EVENT_PASSKEY_ACTION:
+        LOG_INFO("BLE pairing action: handle=%u action=%u local_io=%u", event->passkey.conn_handle, event->passkey.params.action,
+                 ble_hs_cfg.sm_io_cap);
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
 } // namespace
 
 #ifdef ARCH_ESP32
@@ -266,6 +301,7 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     virtual void onConfigStart() override
     {
         LOG_INFO("BLE onConfigStart");
+        LOG_INFO("BLE config start: heap=%u min_heap=%u", ESP.getFreeHeap(), ESP.getMinFreeHeap());
 
         // Prefer high throughput during config/setup, at the cost of high power consumption (for a few seconds)
         uint16_t conn_handle = nimbleBluetoothConnHandle.load();
@@ -277,6 +313,7 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     virtual void onConfigComplete() override
     {
         LOG_INFO("BLE onConfigComplete");
+        LOG_INFO("BLE config complete: heap=%u min_heap=%u", ESP.getFreeHeap(), ESP.getMinFreeHeap());
 
         // Switch to lower power consumption BLE connection params for steady-state use after config/setup is complete
         uint16_t conn_handle = nimbleBluetoothConnHandle.load();
@@ -654,7 +691,7 @@ class NimbleBluetoothSecurityCallback : public BLESecurityCallbacks
 {
     void onPassKeyNotify(uint32_t passkey) override
     {
-        LOG_INFO("*** Enter passkey %06u on the peer side ***", passkey);
+        LOG_INFO("BLE pairing: enter the code shown on the device");
         powerFSM.trigger(EVENT_BLUETOOTH_PAIR);
         meshtastic::BluetoothStatus newStatus(std::to_string(passkey));
         bluetoothStatus->updateStatus(&newStatus);
@@ -691,9 +728,6 @@ class NimbleBluetoothSecurityCallback : public BLESecurityCallbacks
     }
     void onAuthenticationComplete(ble_gap_conn_desc *desc) override
     {
-        // Called on every BLE_GAP_EVENT_ENC_CHANGE, success or failure. A stale-bond reconnect
-        // yields a *failed* encryption change here -- don't latch a connected/authenticated state
-        // on a link that is actually being torn down.
         if (desc == nullptr || !desc->sec_state.encrypted) {
             LOG_WARN("BLE encryption change without encrypted link; ignoring");
             return;
@@ -706,6 +740,32 @@ class NimbleBluetoothSecurityCallback : public BLESecurityCallbacks
         clearPairingDisplay();
 
         nimbleBluetoothConnHandle = desc->conn_handle;
+    }
+
+    void onAuthenticationComplete(ble_gap_conn_desc *desc, int status) override
+    {
+        const uint16_t handle = desc ? desc->conn_handle : BLE_HS_CONN_HANDLE_NONE;
+        if (status != 0) {
+            const char *origin = "host";
+            const char *reason = BLEUtils::returnCodeToString(status);
+            if (status >= BLE_HS_ERR_SM_PEER_BASE && status < BLE_HS_ERR_HW_BASE) {
+                origin = "peer";
+                reason = BLEUtils::smErrorToString(status - BLE_HS_ERR_SM_PEER_BASE);
+            } else if (status >= BLE_HS_ERR_SM_US_BASE && status < BLE_HS_ERR_SM_PEER_BASE) {
+                origin = "local";
+                reason = BLEUtils::smErrorToString(status - BLE_HS_ERR_SM_US_BASE);
+            } else if (status >= BLE_HS_ERR_HCI_BASE && status < BLE_HS_ERR_L2C_BASE) {
+                origin = "controller";
+            }
+            LOG_WARN("BLE authentication failed: handle=%u status=%d (0x%x) origin=%s reason=%s", handle, status, status, origin,
+                     reason);
+            logBleSecuritySettings("failed");
+            return;
+        }
+        LOG_INFO("BLE security complete: handle=%u encrypted=%u authenticated=%u bonded=%u", handle,
+                 desc ? desc->sec_state.encrypted : 0, desc ? desc->sec_state.authenticated : 0,
+                 desc ? desc->sec_state.bonded : 0);
+        onAuthenticationComplete(desc);
     }
 };
 
@@ -752,6 +812,7 @@ class NimbleBluetoothServerCallback : public BLEServerCallbacks
         LOG_INFO("BLE incoming connection %s", peer_addr.toString().c_str());
 
         const uint16_t connHandle = desc->conn_handle;
+        logBleSecuritySettings("connected");
 
         // With Google Pixel 8 Android devices, this causes ESP32 device crash
         // when phone reconnects. Disable this to make progress on the
@@ -772,7 +833,12 @@ class NimbleBluetoothServerCallback : public BLEServerCallbacks
 
     void onDisconnect(BLEServer *pServer, struct ble_gap_conn_desc *desc)
     {
-        LOG_INFO("BLE disconnected");
+        LOG_INFO("BLE disconnected: handle=%u encrypted=%u authenticated=%u bonded=%u", desc->conn_handle,
+                 desc->sec_state.encrypted, desc->sec_state.authenticated, desc->sec_state.bonded);
+        if (bluetoothPhoneAPI)
+            LOG_INFO("BLE API totals: reads=%u writes=%u pending_from_phone=%u pending_to_phone=%u",
+                     bluetoothPhoneAPI->readCount.load(), bluetoothPhoneAPI->writeCount.load(),
+                     bluetoothPhoneAPI->fromPhoneQueueSize.load(), bluetoothPhoneAPI->toPhoneQueueSize.load());
         if (ble->isDeInit)
             return;
 
@@ -789,6 +855,11 @@ class NimbleBluetoothServerCallback : public BLEServerCallbacks
             bluetoothPhoneAPI->setIntervalFromNow(0);
         }
         concurrency::mainDelay.interrupt(); // wake the main loop to service the restart
+    }
+
+    void onMtuChanged(BLEServer *, ble_gap_conn_desc *desc, uint16_t mtu) override
+    {
+        LOG_INFO("BLE MTU negotiated: handle=%u mtu=%u", desc->conn_handle, mtu);
     }
 };
 
@@ -813,7 +884,7 @@ bool NimbleBluetooth::startAdvertising()
         LOG_ERROR("BLE advertising start failed");
         return false;
     } else {
-        LOG_DEBUG("BLE Advertising started");
+        LOG_DEBUG("BLE Advertising started: synced=%u active=%u", ble_hs_synced(), pAdvertising->isAdvertising());
         return true;
     }
 }
@@ -924,6 +995,7 @@ void NimbleBluetooth::setup()
 
     BLEDevice::init(getDeviceName());
     BLEDevice::setPower(ESP_PWR_LVL_P9);
+    LOG_INFO("BLE local address %s", BLEDevice::getAddress().toString().c_str());
 
     int mtuResult = BLEDevice::setMTU(kPreferredBleMtu);
     if (mtuResult == 0) {
@@ -958,6 +1030,8 @@ void NimbleBluetooth::setup()
         // No PIN mode: no MITM protection
         security.setAuthenticationMode(true, false, false);
     }
+    logBleSecuritySettings("configured");
+    BLEDevice::setCustomGapHandler(logBleGapEvent);
     // Statics: setup() re-runs on BLE re-enable, and the library never frees these
     // caller-owned callback objects, so register the same instances every cycle.
     static NimbleBluetoothSecurityCallback securityCallbacks;
@@ -1054,6 +1128,13 @@ void updateBatteryLevel(uint8_t level)
 {
     if (!config.bluetooth.enabled || !BatteryCharacteristic)
         return;
+
+    static uint32_t lastBleStatusMs = 0;
+    if (Throttle::hasElapsed(lastBleStatusMs, 30000)) {
+        lastBleStatusMs = Time::getMillis();
+        LOG_INFO("BLE status: synced=%u advertising=%u connected=%u cpu_mhz=%u heap=%u", ble_hs_synced(), ble_gap_adv_active(),
+                 bleServer ? bleServer->getConnectedCount() : 0, getCpuFrequencyMhz(), ESP.getFreeHeap());
+    }
 
     if (level > 100) // 0x2A19 must stay within the BAS 0-100 range
         level = 100;
