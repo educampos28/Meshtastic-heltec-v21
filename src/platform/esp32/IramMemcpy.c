@@ -11,6 +11,9 @@
 #error "ESP32_FORCE_IRAM_MEMSET is classic-ESP32 only: cache_is_enabled() reads a DPORT register that other targets do not map."
 #endif
 
+#include "soc/dport_access.h"
+#include "soc/dport_reg.h"
+
 /*
  * T-Beam/classic ESP32 boot workaround
  * ------------------------------------
@@ -30,7 +33,9 @@ extern void *__real_memcpy(void *dst, const void *src, size_t n);
 
 static inline bool IRAM_ATTR cache_is_enabled(void)
 {
-    return (*(volatile uint32_t *)0x3FF00040u) & (1u << 3);
+    // Keep the call indirect: Xtensa relaxation can misplace wrapped function symbols.
+    uint32_t (*volatile readRegister)(uint32_t) = esp_dport_access_reg_read;
+    return readRegister(DPORT_PRO_CACHE_CTRL_REG) & DPORT_PRO_CACHE_ENABLE;
 }
 
 extern void *IRAM_ATTR __wrap_memcpy(void *dst, const void *src, size_t n)
